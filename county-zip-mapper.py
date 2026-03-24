@@ -1,17 +1,31 @@
 """
 County ZIP Code Mapper
 ======================
-Fetches all ZIP codes for a specified set of counties and generates
-an interactive choropleth map of those ZIP code areas.
+For a list of counties, generates:
+  - An interactive HTML map of ZIP code areas
+  - A CSV with ZIP, city, county, and notes
+
+Rules:
+  - A ZIP is included if any part of it overlaps a target county
+    (per Census ZCTA-to-County relationship file).
+  - City = USPS/postal city name (from pgeocode/GeoNames).
+  - County in CSV = county where that postal city is located
+    (may differ from the target county if the ZIP straddles a boundary).
+  - If the postal county is not in the target list, a note is added:
+    "ZIP overlaps <target county>"
+  - If the ZIP has no Census shapefile polygon (PO Box / unique ZIP),
+    it is included in the CSV only with note "PO Box only".
+  - Map polygons are colored by the target county with the largest
+    geographic overlap, so the map always reflects your target region.
 
 Dependencies:
     pip install requests folium geopandas shapely pandas pgeocode
 
-Data Sources (all free, no API key required):
-  - US Census Bureau TIGER/Line ZIP Code Tabulation Areas (ZCTA) shapefiles
-  - Census ZCTA→County relationship file  (to discover which ZIPs touch each county)
-  - pgeocode library (GeoNames/USPS postal database) for city names + postal county
-  - Census Geocoder API (county FIPS lookup)
+Data sources (all free, no API key required):
+  - Census TIGER/Line ZCTA shapefile (polygons)
+  - Census ZCTA-to-County relationship file (overlap + area)
+  - pgeocode / GeoNames (postal city and county names)
+  - Census Geocoder API (county name -> FIPS)
 """
 
 import sys
@@ -28,31 +42,26 @@ import requests
 # ─────────────────────────────────────────────
 #  ★  CONFIGURE YOUR COUNTIES HERE  ★
 #  Format: list of (county_name, state_abbr) tuples.
-#  County name should match the official Census name (omit "County").
+#  Omit "County" from the name.
 # ─────────────────────────────────────────────
 TARGET_COUNTIES = [
     ("Scott",       "IA"),
     ("Rock Island", "IL"),
     ("Muscatine",   "IA"),
-    ("Clinton", "IA"),
-    ("Mercer", "IL"),
-    ("Henry", "IL"),
+    ("Clinton","IA"),
+    ("Mercer","IL"),
+    ("Henry","IL"),
 ]
 
+OUTPUT_MAP_HTML = "QC_zip_code_map.html"
+OUTPUT_ZIP_CSV  = "QC_zip_codes_by_county.csv"
 
-
-# Output files
-OUTPUT_MAP_HTML = "zip_code_map.html"
-OUTPUT_ZIP_CSV  = "zip_codes_by_county.csv"
-
-# Cache directory (avoids re-downloading large files)
 CACHE_DIR = Path(".zip_mapper_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
 # ─────────────────────────────────────────────
-#  Step 1 — Resolve county names → FIPS codes
+#  State abbreviation -> 2-digit FIPS
 # ─────────────────────────────────────────────
-
 STATE_FIPS = {
     "AL":"01","AK":"02","AZ":"04","AR":"05","CA":"06","CO":"08","CT":"09",
     "DE":"10","FL":"12","GA":"13","HI":"15","ID":"16","IL":"17","IN":"18",
@@ -64,431 +73,377 @@ STATE_FIPS = {
     "WY":"56","DC":"11","PR":"72",
 }
 
+# ─────────────────────────────────────────────
+#  Step 1 — Resolve county names -> FIPS codes
+# ─────────────────────────────────────────────
 
 def get_county_fips(county_name: str, state_abbr: str) -> str | None:
-    """Return 5-digit FIPS for a county via the Census Geocoder API."""
+    """Return 5-digit FIPS for a county via the Census API."""
     state_fips = STATE_FIPS.get(state_abbr.upper())
     if not state_fips:
-        print(f"  ✗ Unknown state abbreviation: {state_abbr}")
+        print(f"  ✗ Unknown state: {state_abbr}")
         return None
 
-    url = "https://geocoding.geo.census.gov/geocoder/geographies/address"
-    params = {
-        "street": "1 Main St",
-        "city": county_name,
-        "state": state_abbr,
-        "benchmark": "Public_AR_Current",
-        "vintage": "Current_Current",
-        "layers": "Counties",
-        "format": "json",
-    }
+    # Primary: geocoder API
     try:
-        r = requests.get(url, params=params, timeout=15)
-        data = r.json()
-        counties = (data.get("result", {})
-                        .get("addressMatches", [{}])[0]
-                        .get("geographies", {})
-                        .get("Counties", []))
-        if counties:
-            return counties[0]["GEOID"]
+        r = requests.get(
+            "https://geocoding.geo.census.gov/geocoder/geographies/address",
+            params={"street": "1 Main St", "city": county_name, "state": state_abbr,
+                    "benchmark": "Public_AR_Current", "vintage": "Current_Current",
+                    "layers": "Counties", "format": "json"},
+            timeout=15,
+        )
+        matches = (r.json().get("result", {})
+                           .get("addressMatches", [{}])[0]
+                           .get("geographies", {})
+                           .get("Counties", []))
+        if matches:
+            return matches[0]["GEOID"]
     except Exception:
         pass
 
-    # Fallback: search Census county list directly
-    list_url = (
-        f"https://api.census.gov/data/2020/dec/pl"
-        f"?get=NAME&for=county:*&in=state:{state_fips}"
-    )
+    # Fallback: Census county list
     try:
-        r = requests.get(list_url, timeout=15)
-        rows = r.json()[1:]
-        for row in rows:
+        r = requests.get(
+            f"https://api.census.gov/data/2020/dec/pl"
+            f"?get=NAME&for=county:*&in=state:{state_fips}",
+            timeout=15,
+        )
+        for row in r.json()[1:]:
             if county_name.lower() in row[0].lower():
                 return state_fips + row[-1]
     except Exception as e:
-        print(f"  ✗ FIPS lookup failed for {county_name}, {state_abbr}: {e}")
+        print(f"  ✗ FIPS lookup failed: {e}")
 
     return None
 
 
 # ─────────────────────────────────────────────
-#  Step 2 — ZIP → County crosswalk
-#  (used only to discover candidate ZIPs that touch each county;
-#   final county assignment comes from the postal city in Step 3)
+#  Step 2 — Census ZCTA-to-County crosswalk
+#  Gives us every ZIP that overlaps each county,
+#  plus the land area of that overlap for tiebreaking.
 # ─────────────────────────────────────────────
 
-def fetch_zip_county_crosswalk() -> pd.DataFrame:
-    """Census ZCTA-to-County relationship file (2020)."""
-    cache_file = CACHE_DIR / "zip_county_crosswalk.csv"
-    if cache_file.exists():
-        cached = pd.read_csv(cache_file, dtype=str)
-        if "area_land" in cached.columns:
-            print("  ✔ Using cached ZIP→County crosswalk.")
-            return cached
-        else:
-            print("  ℹ Cached crosswalk missing area_land — re-downloading …")
-            cache_file.unlink()
+def fetch_crosswalk() -> pd.DataFrame:
+    cache = CACHE_DIR / "zip_county_crosswalk.csv"
+    if cache.exists():
+        df = pd.read_csv(cache, dtype=str)
+        if "area_land" in df.columns:
+            print("  ✔ Using cached crosswalk.")
+            return df
+        cache.unlink()  # stale — missing area_land
 
     print("  Downloading ZIP→County crosswalk from Census …")
-    url = (
-        "https://www2.census.gov/geo/docs/maps-data/data/rel2020/"
-        "zcta520/tab20_zcta520_county20_natl.txt"
-    )
-    try:
-        r = requests.get(url, timeout=60)
-        r.raise_for_status()
-        df = pd.read_csv(StringIO(r.text), sep="|", dtype=str,
-                         usecols=["GEOID_ZCTA5_20", "GEOID_COUNTY_20",
-                                  "AREALAND_PART"])
-        df.columns = ["zip", "county_fips", "area_land"]
-        df.to_csv(cache_file, index=False)
-        print(f"  ✔ Downloaded {len(df):,} ZIP→County relationships.")
-        return df
-    except Exception as e:
-        print(f"  ✗ Crosswalk download failed: {e}")
-        return pd.DataFrame(columns=["zip", "county_fips"])
-
-
-# ─────────────────────────────────────────────
-#  Step 3 — ZIP → Postal city + county (pgeocode / GeoNames / USPS)
-# ─────────────────────────────────────────────
-
-def fetch_zip_postal_info(zip_codes: list[str]) -> pd.DataFrame:
-    """
-    Return the USPS postal city name AND the 5-digit county FIPS of that
-    city for each ZIP, using pgeocode (GeoNames/USPS postal database).
-
-    pgeocode's 'county_code' field is the FIPS of the county where the
-    post-office city sits — so county assignment follows the postal city,
-    not a geographic area overlap.  A border ZIP like 52726 will be placed
-    in whichever county its post-office city belongs to.
-
-    Install: pip install pgeocode
-    Downloads ~5 MB on first use; fully cached after that.
-    """
-    try:
-        import pgeocode
-    except ImportError:
-        print("  ✗ 'pgeocode' not installed. Run: pip install pgeocode")
-        return pd.DataFrame({
-            "zip": zip_codes,
-            "city": ["Unknown"] * len(zip_codes),
-            "postal_county_fips": [""] * len(zip_codes),
-        })
-
-    print(f"  Looking up postal city + county for {len(zip_codes)} ZIP codes …")
-    nomi = pgeocode.Nominatim("us")
-    result = nomi.query_postal_code(zip_codes)   # single vectorised batch call
-
-    # Diagnostic: print all columns and a sample row to see actual field names
-    print(f"  pgeocode columns: {list(result.columns)}")
-    sample_row = result.iloc[0].to_dict()
-    print("  pgeocode sample row:", sample_row)
-
-    # pgeocode state_code is a 2-letter abbreviation (e.g. 'IA'), not a number.
-    # county_code is a bare 3-digit number (e.g. 139.0 for Muscatine).
-    # Combine using STATE_FIPS lookup to build the full 5-digit Census FIPS.
-    def build_fips(state_abbr, county_val) -> str:
-        if state_abbr != state_abbr or county_val != county_val:  # NaN check
-            return ""
-        try:
-            state_part  = STATE_FIPS.get(str(state_abbr).strip().upper(), "")
-            if not state_part:
-                return ""
-            county_part = str(int(float(county_val))).zfill(3)
-            return state_part + county_part
-        except (ValueError, TypeError):
-            return ""
-
-    fips_list = [
-        build_fips(s, c)
-        for s, c in zip(result["state_code"].values, result["county_code"].values)
-    ]
-
-    df = pd.DataFrame({
-        "zip":                zip_codes,
-        "city":               result["place_name"].fillna("Unknown").values,
-        "postal_county_fips": fips_list,
-        "postal_county_name": result["county_name"].fillna("").values,
-        "postal_state_code":  result["state_code"].fillna("").values,
-    })
-    print("  Sample built FIPS:", [x for x in fips_list if x][:5])
-    print("  ✔ Postal city/county lookup complete.")
+    url = ("https://www2.census.gov/geo/docs/maps-data/data/rel2020/"
+           "zcta520/tab20_zcta520_county20_natl.txt")
+    r = requests.get(url, timeout=60)
+    r.raise_for_status()
+    df = pd.read_csv(StringIO(r.text), sep="|", dtype=str,
+                     usecols=["GEOID_ZCTA5_20", "GEOID_COUNTY_20", "AREALAND_PART"])
+    df.columns = ["zip", "county_fips", "area_land"]
+    df.to_csv(cache, index=False)
+    print(f"  ✔ Downloaded {len(df):,} rows.")
     return df
 
 
 # ─────────────────────────────────────────────
-#  Step 4 — Download ZCTA shapefile
+#  Step 3 — pgeocode postal lookup
+#  For each ZIP returns: city, county_name, state_code
 # ─────────────────────────────────────────────
 
-def fetch_zcta_shapefile() -> gpd.GeoDataFrame:
-    """National ZCTA shapefile from Census TIGER/Line (~170 MB, cached)."""
+def postal_lookup(zip_codes: list[str]) -> pd.DataFrame:
+    try:
+        import pgeocode
+    except ImportError:
+        print("  ✗ pgeocode not installed. Run: pip install pgeocode")
+        sys.exit(1)
+
+    print(f"  Looking up {len(zip_codes)} ZIP codes in postal database …")
+    nomi = pgeocode.Nominatim("us")
+    result = nomi.query_postal_code(zip_codes)
+
+    return pd.DataFrame({
+        "zip":         zip_codes,
+        "city":        result["place_name"].fillna("").values,
+        "county_name": result["county_name"].fillna("").values,
+        "state_code":  result["state_code"].fillna("").values,
+    })
+
+
+# ─────────────────────────────────────────────
+#  Step 4 — ZCTA shapefile
+# ─────────────────────────────────────────────
+
+def fetch_shapefile() -> gpd.GeoDataFrame:
     cache_shp = CACHE_DIR / "zcta" / "tl_2023_us_zcta520.shp"
     if cache_shp.exists():
         print("  ✔ Using cached ZCTA shapefile.")
         return gpd.read_file(cache_shp)
 
-    print("  Downloading ZCTA shapefile from Census TIGER/Line (~170 MB) …")
-    url = (
-        "https://www2.census.gov/geo/tiger/TIGER2023/ZCTA520/"
-        "tl_2023_us_zcta520.zip"
-    )
-    try:
-        r = requests.get(url, timeout=300, stream=True)
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        downloaded = 0
-        buf = BytesIO()
-        for chunk in r.iter_content(chunk_size=1 << 20):
-            buf.write(chunk)
-            downloaded += len(chunk)
-            if total:
-                print(f"    {downloaded/total*100:.0f}%", end="\r", flush=True)
-        print()
-
-        out_dir = CACHE_DIR / "zcta"
-        out_dir.mkdir(exist_ok=True)
-        with zipfile.ZipFile(buf) as z:
-            z.extractall(out_dir)
-
-        print("  ✔ ZCTA shapefile extracted.")
-        return gpd.read_file(cache_shp)
-    except Exception as e:
-        print(f"  ✗ ZCTA shapefile download failed: {e}")
-        sys.exit(1)
+    print("  Downloading ZCTA shapefile (~170 MB) …")
+    url = ("https://www2.census.gov/geo/tiger/TIGER2023/ZCTA520/"
+           "tl_2023_us_zcta520.zip")
+    r = requests.get(url, timeout=300, stream=True)
+    r.raise_for_status()
+    total = int(r.headers.get("content-length", 0))
+    buf = BytesIO()
+    done = 0
+    for chunk in r.iter_content(1 << 20):
+        buf.write(chunk)
+        done += len(chunk)
+        if total:
+            print(f"    {done/total*100:.0f}%", end="\r", flush=True)
+    print()
+    out = CACHE_DIR / "zcta"
+    out.mkdir(exist_ok=True)
+    with zipfile.ZipFile(buf) as z:
+        z.extractall(out)
+    print("  ✔ Extracted.")
+    return gpd.read_file(cache_shp)
 
 
 # ─────────────────────────────────────────────
-#  Step 5 — Build ZIP GeoDataFrame
+#  Step 5 — Build the ZIP table
 # ─────────────────────────────────────────────
 
-def build_zip_geodataframe(
-    counties: list[tuple[str, str]]
-) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
+def build_zip_table(target_counties: list[tuple[str, str]]) -> pd.DataFrame:
     """
-    County assignment logic:
-      1. Use the Census crosswalk to find all ZIPs that touch any target county.
-      2. Look up each candidate ZIP's postal city + that city's county FIPS
-         via pgeocode (USPS / GeoNames).
-      3. Keep only ZIPs whose postal-city county is one of the target counties.
-         This means a border ZIP is placed in whatever county its post office
-         city belongs to — not split or duplicated.
-      4. ZIPs whose postal city falls outside all target counties are dropped
-         (they only graze a target county geographically; they don't belong to it
-         postally).
+    Returns a DataFrame with columns:
+      zip, city, postal_county, postal_state, target_county, note
 
-    Returns:
-      - GeoDataFrame of ZCTA polygons (zip, city, county_label)
-      - Flat DataFrame of the same rows (for CSV export)
+    target_county = the target county with the largest area overlap
+                    (used for map coloring)
+    postal_county = county where the postal city is located
+                    (used for CSV display)
+    note          = explanation if postal county != target county,
+                    or 'PO Box only' if no shapefile polygon exists
     """
-    print("\n[1/5] Resolving county FIPS codes …")
-    county_fips_map: dict[str, str] = {}   # fips → "County, ST" label
-    for county_name, state_abbr in counties:
-        label = f"{county_name} County, {state_abbr.upper()}"
-        print(f"  Looking up {label} …")
-        fips = get_county_fips(county_name, state_abbr)
+
+    # --- Resolve target county FIPS ---
+    print("\n[1/4] Resolving county FIPS codes …")
+    # fips -> "Name County, ST"
+    fips_to_label: dict[str, str] = {}
+    # (county_name_lower, state_upper) -> fips  (for postal matching)
+    name_state_to_fips: dict[tuple, str] = {}
+
+    for cname, state in target_counties:
+        label = f"{cname} County, {state.upper()}"
+        print(f"  {label} …", end=" ")
+        fips = get_county_fips(cname, state)
         if fips:
-            county_fips_map[fips] = label
-            print(f"  ✔ {label} → FIPS {fips}")
+            fips_to_label[fips] = label
+            name_state_to_fips[(cname.lower(), state.upper())] = fips
+            print(f"FIPS {fips}")
         else:
-            print(f"  ✗ Could not find FIPS for {label}")
+            print("NOT FOUND")
         time.sleep(0.3)
 
-    if not county_fips_map:
-        print("No valid counties found. Check your TARGET_COUNTIES list.")
+    if not fips_to_label:
+        print("No counties resolved. Check TARGET_COUNTIES.")
         sys.exit(1)
 
-    print("\n[2/5] Fetching ZIP→County crosswalk …")
-    crosswalk = fetch_zip_county_crosswalk()
-    target_fips = set(county_fips_map.keys())
+    target_fips = set(fips_to_label.keys())
 
-    # TWO candidate sources so no ZIP is missed:
-    # A) geographic: ZIPs whose area touches a target county
-    # B) postal: all ZIPs in the target states (catches ZIPs whose
-    #    postal city is in a target county but polygon doesn't touch it)
-    geo_candidates = set(
-        crosswalk[crosswalk["county_fips"].isin(target_fips)]["zip"]
-        .dropna().unique()
-    )
-    target_state_fips = {f[:2] for f in target_fips}
-    state_candidates = set(
-        crosswalk[crosswalk["county_fips"].str[:2].isin(target_state_fips)]["zip"]
-        .dropna().unique()
-    )
-    all_candidates = sorted(str(z) for z in (geo_candidates | state_candidates))
-    print(f"  {len(geo_candidates)} ZIPs touch target counties geographically.")
-    print(f"  {len(state_candidates)} ZIPs are in the target states.")
-    print(f"  {len(all_candidates)} unique candidate ZIPs to evaluate.")
+    # --- Crosswalk: find all ZIPs touching target counties ---
+    print("\n[2/4] Loading crosswalk …")
+    xwalk = fetch_crosswalk()
+    xwalk["area_land"] = pd.to_numeric(xwalk["area_land"], errors="coerce").fillna(0)
 
-    print("\n[3/5] Fetching postal city + county for candidate ZIPs …")
-    postal = fetch_zip_postal_info(all_candidates)
+    # For each ZIP that touches any target county, find the target county
+    # with the LARGEST area overlap -> this is the map color / primary association
+    target_rows = xwalk[xwalk["county_fips"].isin(target_fips)].copy()
+    best = (target_rows.sort_values("area_land", ascending=False)
+                       .drop_duplicates(subset="zip", keep="first")
+                       [["zip", "county_fips"]])
+    best["target_county"] = best["county_fips"].map(fips_to_label)
+    candidate_zips = best["zip"].dropna().unique().tolist()
+    print(f"  {len(candidate_zips)} ZIPs overlap the target counties.")
 
-    # Primary: ZIPs whose postal city county is a target county
-    postal["county_label"] = postal["postal_county_fips"].map(county_fips_map)
-    matched = postal[postal["county_label"].notna()].copy()
-
-    # Fallback: geographic candidates not matched by postal city
-    # assigned by largest land-area overlap with a target county
-    unmatched_geo = postal[
-        postal["county_label"].isna() & postal["zip"].isin(geo_candidates)
+    # --- Postal lookup (full pgeocode database for target states) ---
+    # PO Box ZIPs have zero land area and no crosswalk entry at all.
+    # The only way to find them is to query pgeocode's full database
+    # and filter by state + county name. We do NOT rely on the crosswalk
+    # for this step — we query pgeocode for every ZIP it knows about in
+    # the target states by reading its cached SQLite database directly.
+    target_state_abbrs = {label.split(",")[1].strip().upper()
+                          for label in fips_to_label.values()}
+    print(f"\n[3/4] Loading full postal database for states: {target_state_abbrs} …")
+    import pgeocode as _pgeocode
+    nomi = _pgeocode.Nominatim("us")
+    # Access the underlying dataframe that pgeocode caches locally
+    all_postal_df = nomi._data.copy()
+    all_postal_df = all_postal_df.rename(columns={
+        "postal_code": "zip",
+        "place_name":  "city",
+        "county_name": "county_name",
+        "state_code":  "state_code",
+    })
+    # Keep only ZIPs in target states
+    state_postal = all_postal_df[
+        all_postal_df["state_code"].str.upper().isin(target_state_abbrs)
     ].copy()
-    if not unmatched_geo.empty:
-        crosswalk["area_land"] = pd.to_numeric(
-            crosswalk["area_land"], errors="coerce").fillna(0)
-        target_rows = crosswalk[crosswalk["county_fips"].isin(target_fips)].copy()
-        best = (target_rows.sort_values("area_land", ascending=False)
-                           .drop_duplicates(subset="zip", keep="first")
-                           [["zip", "county_fips"]])
-        fallback = unmatched_geo.merge(best, on="zip", how="inner")
-        fallback["county_label"] = fallback["county_fips"].map(county_fips_map)
-        fallback = fallback.drop(columns=["county_fips"])
-        if not fallback.empty:
-            print(f"  ℹ {len(fallback)} ZIP(s) assigned by geographic fallback:")
-            for _, row in fallback.iterrows():
-                print(f"    {row['zip']} ({row['city']}) -> {row['county_label']}")
-        matched = pd.concat([matched, fallback], ignore_index=True)
+    state_postal["zip"] = state_postal["zip"].astype(str).str.zfill(5)
+    # Union with crosswalk candidates (other states if multi-state target)
+    all_zip_set = set(str(z).zfill(5) for z in candidate_zips) | set(state_postal["zip"])
+    # Build postal lookup from pgeocode data directly (no extra API call)
+    postal = state_postal[state_postal["zip"].isin(all_zip_set)][
+        ["zip", "city", "county_name", "state_code"]
+    ].drop_duplicates("zip").copy()
+    # For ZIPs in candidate_zips from other states, fall back to API lookup
+    other_zips = [z for z in candidate_zips
+                  if str(z).zfill(5) not in set(state_postal["zip"])]
+    if other_zips:
+        print(f"  Looking up {len(other_zips)} ZIPs from other states …")
+        extra = postal_lookup(other_zips)
+        postal = pd.concat([postal, extra], ignore_index=True).drop_duplicates("zip")
+    postal["city"] = postal["city"].fillna("").where(postal["city"].fillna("") != "",
+                                                      other="Unknown")
+    postal["county_name"] = postal["county_name"].fillna("")
+    postal["state_code"]  = postal["state_code"].fillna("")
+    print(f"  {len(postal)} ZIPs loaded from postal database.")
 
-    # PO Box fallback: ZIPs still unmatched after both postal-FIPS and
-    # geographic fallback. PO Box ZIPs have NaN lat/lon/county_code in
-    # pgeocode but DO have county_name. Match by county name + state.
-    still_unmatched = postal[
-        ~postal["zip"].isin(matched["zip"])
+    # Build "County, ST" label from postal county_name + state_code
+    def make_postal_county(row) -> str:
+        c = str(row["county_name"]).strip()
+        s = str(row["state_code"]).strip().upper()
+        if c and s:
+            return f"{c} County, {s}"
+        return ""
+
+    postal["postal_county"] = postal.apply(make_postal_county, axis=1)
+    postal["city"] = postal["city"].where(postal["city"] != "", other="Unknown")
+
+    # Find PO Box ZIPs: not in geo candidates, but whose postal county
+    # matches a target county by name. Assign them target_county directly.
+    target_labels = set(fips_to_label.values())
+    po_box_rows = postal[
+        (~postal["zip"].isin(candidate_zips)) &
+        (postal["postal_county"].isin(target_labels))
     ].copy()
-    if not still_unmatched.empty:
-        # Build a lookup: (county_name_lower, state_abbr) -> county_label
-        name_state_map = {}
-        for fips, label in county_fips_map.items():
-            # label is e.g. "Scott County, IA"
-            parts = label.split(",")
-            cname = parts[0].replace("County", "").strip().lower()
-            state = parts[1].strip().upper() if len(parts) > 1 else ""
-            name_state_map[(cname, state)] = label
+    po_box_rows["target_county"] = po_box_rows["postal_county"]
 
-        def match_by_name(row):
-            cname = str(row["postal_county_name"]).strip().lower()
-            state = str(row["postal_state_code"]).strip().upper()
-            return name_state_map.get((cname, state), None)
+    # Extend best with PO Box entries (no area overlap row needed)
+    if not po_box_rows.empty:
+        print(f"  Found {len(po_box_rows)} PO Box ZIP(s) via postal county match.")
+        po_best = po_box_rows[["zip", "target_county"]].drop_duplicates("zip")
+        best = pd.concat([best[["zip", "target_county"]], po_best], ignore_index=True)
+        best = best.drop_duplicates("zip", keep="first")
 
-        still_unmatched["county_label"] = still_unmatched.apply(
-            match_by_name, axis=1
-        )
-        po_matched = still_unmatched[still_unmatched["county_label"].notna()].copy()
-        if not po_matched.empty:
-            print(f"  ℹ {len(po_matched)} PO Box ZIP(s) matched by county name:")
-            for _, row in po_matched.iterrows():
-                print(f"    {row['zip']} ({row['city']}) -> {row['county_label']}")
-            matched = pd.concat([matched, po_matched], ignore_index=True)
+    # --- Merge everything ---
+    df = best[["zip", "target_county"]].merge(postal, on="zip", how="left")
 
-    filtered = matched.drop_duplicates(subset="zip").reset_index(drop=True)
-    print(f"  {len(filtered)} ZIPs assigned in total.")
+    # Build note:
+    # - If postal county IS a target county -> no note needed
+    # - If postal county is NOT a target county -> explain inclusion
+    # - PO Box / no polygon -> added later after shapefile check
+    def make_note(row) -> str:
+        pc = row["postal_county"]
+        tc = row["target_county"]
+        # Is the postal county one of our targets?
+        if pc in fips_to_label.values():
+            return ""
+        # Postal county is outside our list
+        if pc:
+            return f"ZIP overlaps {tc}"
+        # pgeocode returned nothing (PO Box or unknown)
+        return f"ZIP overlaps {tc}"
 
-    print("\n  ZIP codes assigned per county:")
-    for county in sorted(filtered["county_label"].unique()):
-        n = len(filtered[filtered["county_label"] == county])
-        print(f"    {county}: {n} ZIPs")
+    df["note"] = df.apply(make_note, axis=1)
 
-    print("\n[4/5] (skipped — county already assigned from postal data)")
+    # Clean up columns
+    df = df[["zip", "city", "postal_county", "postal_state",
+             "target_county", "note"]].copy() if "postal_state" in df.columns else \
+         df.assign(postal_state=df["state_code"] if "state_code" in df.columns else "")[
+             ["zip", "city", "postal_county", "target_county", "note"]]
 
-    print("\n[5/5] Loading ZCTA geometries …")
-    zcta_gdf = fetch_zcta_shapefile()
+    # Ensure we have the state col
+    df = df.merge(postal[["zip", "state_code"]], on="zip", how="left")
 
-    target_zips = set(filtered["zip"].unique())
-    zcta_col = "ZCTA5CE20" if "ZCTA5CE20" in zcta_gdf.columns else zcta_gdf.columns[0]
-    geo = zcta_gdf[zcta_gdf[zcta_col].isin(target_zips)].copy()
-    geo = geo.rename(columns={zcta_col: "zip"})
-    geo = geo.merge(filtered[["zip", "city", "county_label"]], on="zip", how="left")
-    geo = geo.to_crs(epsg=4326)
-
-    # Identify PO Box-only ZIPs: in filtered but not in the shapefile.
-    # They have no polygon so they appear in the CSV but not the map.
-    mapped_zips = set(geo["zip"].unique())
-    po_box_only = filtered[~filtered["zip"].isin(mapped_zips)].copy()
-    po_box_only = po_box_only.assign(note="PO Box only - no map polygon")
-    if not po_box_only.empty:
-        print(f"  ℹ {len(po_box_only)} PO Box-only ZIP(s) included in CSV but not map:")
-        for _, row in po_box_only.iterrows():
-            print(f"    {row['zip']} ({row['city']}, {row['county_label']})")
-
-    return geo, filtered, po_box_only
+    return df, candidate_zips
 
 
 # ─────────────────────────────────────────────
-#  Step 6 — Build interactive Folium map
+#  Step 6 — Build GeoDataFrame + flag PO Box ZIPs
 # ─────────────────────────────────────────────
 
-COUNTY_COLORS = [
+def build_geo(df: pd.DataFrame) -> tuple[gpd.GeoDataFrame, pd.DataFrame]:
+    """
+    Load shapefile, merge with ZIP table.
+    Returns (geo_gdf, updated_df) where updated_df has PO Box notes added.
+    """
+    print("\n[4/4] Loading ZCTA shapefile …")
+    shp = fetch_shapefile()
+    zcta_col = "ZCTA5CE20" if "ZCTA5CE20" in shp.columns else shp.columns[0]
+    shp = shp.rename(columns={zcta_col: "zip"})
+    shp = shp.to_crs(epsg=4326)
+
+    target_zips = set(df["zip"].unique())
+    geo = shp[shp["zip"].isin(target_zips)].copy()
+    geo = geo.merge(df[["zip", "city", "postal_county", "target_county", "note"]],
+                    on="zip", how="left")
+
+    # Flag ZIPs with no polygon
+    mapped = set(geo["zip"].unique())
+    po_mask = ~df["zip"].isin(mapped)
+    df.loc[po_mask, "note"] = "PO Box only"
+
+    n_po = po_mask.sum()
+    if n_po:
+        print(f"  ℹ {n_po} PO Box-only ZIP(s) included in CSV but not map:")
+        for _, row in df[po_mask].iterrows():
+            print(f"    {row['zip']} ({row['city']}, {row['postal_county']})")
+
+    return geo, df
+
+
+# ─────────────────────────────────────────────
+#  Step 7 — Build Folium map
+# ─────────────────────────────────────────────
+
+COLORS = [
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
     "#8c564b", "#e377c2", "#7f7f7f", "#bcbd22", "#17becf",
 ]
 
 
 def build_map(geo: gpd.GeoDataFrame) -> folium.Map:
-    """Create an interactive Folium map with ZIP, City, and County tooltips."""
     if geo.empty:
-        raise ValueError(
-            "No ZCTA geometries found. This usually means no ZIPs matched — "
-            "check the diagnostic output above for county_code format issues."
-        )
-    union = geo.geometry.unary_union
-    centroid = union.centroid
-    if centroid.is_empty:
-        # Fallback: use bounds midpoint
-        b = union.bounds
-        centroid_y = (b[1] + b[3]) / 2
-        centroid_x = (b[0] + b[2]) / 2
-    else:
-        centroid_y, centroid_x = centroid.y, centroid.x
-    m = folium.Map(
-        location=[centroid_y, centroid_x],
-        zoom_start=9,
-        tiles="CartoDB positron",
-    )
+        raise ValueError("No geometries — nothing to map.")
 
-    counties = geo["county_label"].unique()
-    color_map = {c: COUNTY_COLORS[i % len(COUNTY_COLORS)]
-                 for i, c in enumerate(sorted(counties))}
+    centroid = geo.geometry.unary_union.centroid
+    m = folium.Map(location=[centroid.y, centroid.x],
+                   zoom_start=9, tiles="CartoDB positron")
+
+    counties = sorted(geo["target_county"].dropna().unique())
+    color_map = {c: COLORS[i % len(COLORS)] for i, c in enumerate(counties)}
 
     for county, color in color_map.items():
-        county_geo = geo[geo["county_label"] == county]
+        layer = geo[geo["target_county"] == county]
         folium.GeoJson(
-            county_geo.__geo_interface__,
+            layer.__geo_interface__,
             name=county,
-            style_function=lambda feat, c=color: {
-                "fillColor": c,
-                "color": "white",
-                "weight": 1.2,
-                "fillOpacity": 0.55,
+            style_function=lambda f, c=color: {
+                "fillColor": c, "color": "white",
+                "weight": 1.2, "fillOpacity": 0.55,
             },
-            highlight_function=lambda feat: {
-                "weight": 2.5,
-                "fillOpacity": 0.8,
-            },
+            highlight_function=lambda f: {"weight": 2.5, "fillOpacity": 0.8},
             tooltip=folium.GeoJsonTooltip(
-                fields=["zip", "city", "county_label"],
-                aliases=["ZIP Code:", "City:", "County:"],
-                localize=True,
+                fields=["zip", "city", "postal_county", "note"],
+                aliases=["ZIP:", "City:", "County:", "Note:"],
             ),
         ).add_to(m)
 
     # Legend
-    legend_html = """
-    <div style="
-        position: fixed; bottom: 30px; left: 30px; z-index: 1000;
-        background: white; padding: 12px 18px; border-radius: 8px;
-        box-shadow: 0 2px 8px rgba(0,0,0,.25); font-family: sans-serif;
-        font-size: 13px; line-height: 1.8;
-    ">
-    <b>Counties</b><br>
-    """
+    legend = ('<div style="position:fixed;bottom:30px;left:30px;z-index:1000;'
+              'background:white;padding:12px 18px;border-radius:8px;'
+              'box-shadow:0 2px 8px rgba(0,0,0,.25);font-family:sans-serif;'
+              'font-size:13px;line-height:1.8"><b>Target Counties</b><br>')
     for county, color in sorted(color_map.items()):
-        legend_html += (
-            f'<span style="display:inline-block;width:14px;height:14px;'
-            f'background:{color};margin-right:6px;border-radius:3px;'
-            f'vertical-align:middle;"></span>{county}<br>'
-        )
-    legend_html += "</div>"
-    m.get_root().html.add_child(folium.Element(legend_html))
-
+        legend += (f'<span style="display:inline-block;width:14px;height:14px;'
+                   f'background:{color};margin-right:6px;border-radius:3px;'
+                   f'vertical-align:middle"></span>{county}<br>')
+    legend += "</div>"
+    m.get_root().html.add_child(folium.Element(legend))
     folium.LayerControl().add_to(m)
     return m
 
@@ -503,43 +458,37 @@ def main():
     print("=" * 55)
     print(f"\nTarget counties: {TARGET_COUNTIES}\n")
 
-    geo, filtered, po_box_only = build_zip_geodataframe(TARGET_COUNTIES)
+    df, candidate_zips = build_zip_table(TARGET_COUNTIES)
+    geo, df = build_geo(df)
 
-    # ── Save CSV  (county | zip | city | note)
-    # Regular ZIPs have an empty note; PO Box-only ZIPs are flagged.
-    csv_df = (
-        filtered[["county_label", "zip", "city"]]
-        .rename(columns={"county_label": "county"})
-        .assign(note="")
-    )
-    if not po_box_only.empty:
-        po_csv = (
-            po_box_only[["county_label", "zip", "city", "note"]]
-            .rename(columns={"county_label": "county"})
-        )
-        csv_df = pd.concat([csv_df, po_csv], ignore_index=True)
-    csv_df = csv_df.sort_values(["county", "zip"]).reset_index(drop=True)
-    csv_df.to_csv(OUTPUT_ZIP_CSV, index=False)
-    print(f"\n✔ ZIP list saved → {OUTPUT_ZIP_CSV}")
+    # CSV: zip | city | county | note
+    # "county" = postal county (where the city is), or target county if unknown
+    def csv_county(row):
+        return row["postal_county"] if row["postal_county"] else row["target_county"]
 
-    # ── Save Map
-    print("  Building interactive map …")
+    csv = df.copy()
+    csv["county"] = csv.apply(csv_county, axis=1)
+    csv = (csv[["county", "zip", "city", "note"]]
+           .sort_values(["county", "zip"])
+           .reset_index(drop=True))
+    csv.to_csv(OUTPUT_ZIP_CSV, index=False)
+    print(f"\n✔ CSV saved  → {OUTPUT_ZIP_CSV}  ({len(csv)} ZIPs)")
+
+    # Map
+    print("  Building map …")
     m = build_map(geo)
     m.save(OUTPUT_MAP_HTML)
-    print(f"✔ Map saved        → {OUTPUT_MAP_HTML}")
+    print(f"✔ Map saved  → {OUTPUT_MAP_HTML}")
 
-    # ── Print summary
-    print("\n── Summary ─────────────────────────────────────")
-    po_zips = set(po_box_only["zip"]) if not po_box_only.empty else set()
-    all_rows = pd.concat([filtered, po_box_only], ignore_index=True)
-    for county in sorted(all_rows["county_label"].unique()):
-        rows = all_rows[all_rows["county_label"] == county].sort_values("zip")
+    # Console summary
+    print("\n── Summary " + "─" * 44)
+    for county in sorted(csv["county"].unique()):
+        rows = csv[csv["county"] == county].sort_values("zip")
         print(f"\n  {county} ({len(rows)} ZIPs):")
-        print(f"  {'ZIP':<8} {'City':<25} {'Note'}")
-        print(f"  {'─'*7} {'─'*25} {'─'*18}")
+        print(f"  {'ZIP':<8} {'City':<26} {'Note'}")
+        print(f"  {'─'*7} {'─'*26} {'─'*30}")
         for _, row in rows.iterrows():
-            note = "PO Box only" if row["zip"] in po_zips else ""
-            print(f"  {row['zip']:<8} {row['city']:<25} {note}")
+            print(f"  {row['zip']:<8} {row['city']:<26} {row['note']}")
     print("\n" + "=" * 55)
 
 
